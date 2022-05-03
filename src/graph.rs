@@ -1,6 +1,7 @@
 //! A graph representation for computing tree diffs.
 
 use rpds::Stack;
+use rustc_hash::FxHashMap;
 use std::{
     cmp::min,
     fmt,
@@ -44,8 +45,8 @@ use Edge::*;
 /// ```
 #[derive(Debug, Clone)]
 pub struct Vertex<'a> {
-    pub lhs_syntax: Option<&'a Syntax<'a>>,
-    pub rhs_syntax: Option<&'a Syntax<'a>>,
+    pub lhs_syntax: Option<SyntaxId>,
+    pub rhs_syntax: Option<SyntaxId>,
     parents: Stack<EnteredDelimiter<'a>>,
     lhs_parent_id: Option<SyntaxId>,
     rhs_parent_id: Option<SyntaxId>,
@@ -54,8 +55,8 @@ pub struct Vertex<'a> {
 
 impl<'a> PartialEq for Vertex<'a> {
     fn eq(&self, other: &Self) -> bool {
-        self.lhs_syntax.map(|node| node.id()) == other.lhs_syntax.map(|node| node.id())
-            && self.rhs_syntax.map(|node| node.id()) == other.rhs_syntax.map(|node| node.id())
+        self.lhs_syntax == other.lhs_syntax
+        && self.rhs_syntax == other.rhs_syntax
             // Strictly speaking, we should compare the whole
             // EnteredDelimiter stack, not just the immediate
             // parents. By taking the immediate parent, we have
@@ -86,8 +87,8 @@ impl<'a> Eq for Vertex<'a> {}
 
 impl<'a> Hash for Vertex<'a> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.lhs_syntax.map(|node| node.id()).hash(state);
-        self.rhs_syntax.map(|node| node.id()).hash(state);
+        self.lhs_syntax.hash(state);
+        self.rhs_syntax.hash(state);
 
         self.lhs_parent_id.hash(state);
         self.rhs_parent_id.hash(state);
@@ -252,7 +253,7 @@ impl<'a> Vertex<'a> {
         self.lhs_syntax.is_none() && self.rhs_syntax.is_none() && self.parents.is_empty()
     }
 
-    pub fn new(lhs_syntax: Option<&'a Syntax<'a>>, rhs_syntax: Option<&'a Syntax<'a>>) -> Self {
+    pub fn new(lhs_syntax: Option<SyntaxId>, rhs_syntax: Option<SyntaxId>) -> Self {
         let parents = Stack::new();
         Vertex {
             lhs_syntax,
@@ -332,7 +333,11 @@ impl Edge {
 }
 
 /// Calculate all the neighbours from `v` and write them to `buf`.
-pub fn neighbours<'a>(v: &Vertex<'a>, buf: &mut [Option<(Edge, Vertex<'a>)>]) {
+pub fn neighbours<'a>(
+    v: &Vertex<'a>,
+    buf: &mut [Option<(Edge, Vertex<'a>)>],
+    syn_by_id: &FxHashMap<SyntaxId, &'a Syntax<'a>>,
+) {
     for item in &mut *buf {
         *item = None;
     }
@@ -348,8 +353,8 @@ pub fn neighbours<'a>(v: &Vertex<'a>, buf: &mut [Option<(Edge, Vertex<'a>)>]) {
             buf[i] = Some((
                 ExitDelimiterBoth,
                 Vertex {
-                    lhs_syntax: lhs_parent.next_sibling(),
-                    rhs_syntax: rhs_parent.next_sibling(),
+                    lhs_syntax: lhs_parent.next_sibling().map(Syntax::id),
+                    rhs_syntax: rhs_parent.next_sibling().map(Syntax::id),
                     can_pop_either: can_pop_either_parent(&parents_next),
                     parents: parents_next,
                     lhs_parent_id: lhs_parent.parent().map(Syntax::id),
@@ -368,7 +373,7 @@ pub fn neighbours<'a>(v: &Vertex<'a>, buf: &mut [Option<(Edge, Vertex<'a>)>]) {
             buf[i] = Some((
                 ExitDelimiterLHS,
                 Vertex {
-                    lhs_syntax: lhs_parent.next_sibling(),
+                    lhs_syntax: lhs_parent.next_sibling().map(Syntax::id),
                     rhs_syntax: v.rhs_syntax,
                     can_pop_either: can_pop_either_parent(&parents_next),
                     parents: parents_next,
@@ -389,7 +394,7 @@ pub fn neighbours<'a>(v: &Vertex<'a>, buf: &mut [Option<(Edge, Vertex<'a>)>]) {
                 ExitDelimiterRHS,
                 Vertex {
                     lhs_syntax: v.lhs_syntax,
-                    rhs_syntax: rhs_parent.next_sibling(),
+                    rhs_syntax: rhs_parent.next_sibling().map(Syntax::id),
                     can_pop_either: can_pop_either_parent(&parents_next),
                     parents: parents_next,
                     lhs_parent_id: v.lhs_parent_id,
@@ -400,7 +405,10 @@ pub fn neighbours<'a>(v: &Vertex<'a>, buf: &mut [Option<(Edge, Vertex<'a>)>]) {
         }
     }
 
-    if let (Some(lhs_syntax), Some(rhs_syntax)) = (&v.lhs_syntax, &v.rhs_syntax) {
+    if let (Some(lhs_syntax_id), Some(rhs_syntax_id)) = (&v.lhs_syntax, &v.rhs_syntax) {
+        let lhs_syntax = syn_by_id[lhs_syntax_id];
+        let rhs_syntax = syn_by_id[rhs_syntax_id];
+        
         if lhs_syntax == rhs_syntax {
             let depth_difference = (lhs_syntax.num_ancestors() as i32
                 - rhs_syntax.num_ancestors() as i32)
@@ -410,8 +418,8 @@ pub fn neighbours<'a>(v: &Vertex<'a>, buf: &mut [Option<(Edge, Vertex<'a>)>]) {
             buf[i] = Some((
                 UnchangedNode { depth_difference },
                 Vertex {
-                    lhs_syntax: lhs_syntax.next_sibling(),
-                    rhs_syntax: rhs_syntax.next_sibling(),
+                    lhs_syntax: lhs_syntax.next_sibling().map(Syntax::id),
+                    rhs_syntax: rhs_syntax.next_sibling().map(Syntax::id),
                     parents: v.parents.clone(),
                     lhs_parent_id: v.lhs_parent_id,
                     rhs_parent_id: v.rhs_parent_id,
@@ -438,8 +446,8 @@ pub fn neighbours<'a>(v: &Vertex<'a>, buf: &mut [Option<(Edge, Vertex<'a>)>]) {
         {
             // The list delimiters are equal, but children may not be.
             if lhs_open_content == rhs_open_content && lhs_close_content == rhs_close_content {
-                let lhs_next = lhs_children.get(0).copied();
-                let rhs_next = rhs_children.get(0).copied();
+                let lhs_next = lhs_children.get(0).map(|n| n.id());
+                let rhs_next = rhs_children.get(0).map(|n| n.id());
 
                 // TODO: be consistent between parents_next and next_parents.
                 let parents_next = push_both_delimiters(&v.parents, lhs_syntax, rhs_syntax);
@@ -484,8 +492,8 @@ pub fn neighbours<'a>(v: &Vertex<'a>, buf: &mut [Option<(Edge, Vertex<'a>)>]) {
                 buf[i] = Some((
                     ReplacedComment { levenshtein_pct },
                     Vertex {
-                        lhs_syntax: lhs_syntax.next_sibling(),
-                        rhs_syntax: rhs_syntax.next_sibling(),
+                        lhs_syntax: lhs_syntax.next_sibling().map(Syntax::id),
+                        rhs_syntax: rhs_syntax.next_sibling().map(Syntax::id),
                         parents: v.parents.clone(),
                         lhs_parent_id: v.lhs_parent_id,
                         rhs_parent_id: v.rhs_parent_id,
@@ -497,7 +505,8 @@ pub fn neighbours<'a>(v: &Vertex<'a>, buf: &mut [Option<(Edge, Vertex<'a>)>]) {
         }
     }
 
-    if let Some(lhs_syntax) = &v.lhs_syntax {
+    if let Some(lhs_syntax_id) = &v.lhs_syntax {
+        let lhs_syntax = syn_by_id[lhs_syntax_id];
         match lhs_syntax {
             // Step over this novel atom.
             Syntax::Atom { .. } => {
@@ -508,7 +517,7 @@ pub fn neighbours<'a>(v: &Vertex<'a>, buf: &mut [Option<(Edge, Vertex<'a>)>]) {
                         contiguous: lhs_syntax.prev_is_contiguous(),
                     },
                     Vertex {
-                        lhs_syntax: lhs_syntax.next_sibling(),
+                        lhs_syntax: lhs_syntax.next_sibling().map(Syntax::id),
                         rhs_syntax: v.rhs_syntax,
                         parents: v.parents.clone(),
                         lhs_parent_id: v.lhs_parent_id,
@@ -520,7 +529,7 @@ pub fn neighbours<'a>(v: &Vertex<'a>, buf: &mut [Option<(Edge, Vertex<'a>)>]) {
             }
             // Step into this partially/fully novel list.
             Syntax::List { children, .. } => {
-                let lhs_next = children.get(0).copied();
+                let lhs_next = children.get(0).map(|n| n.id());
 
                 let parents_next = push_lhs_delimiter(&v.parents, lhs_syntax);
 
@@ -542,7 +551,8 @@ pub fn neighbours<'a>(v: &Vertex<'a>, buf: &mut [Option<(Edge, Vertex<'a>)>]) {
         }
     }
 
-    if let Some(rhs_syntax) = &v.rhs_syntax {
+    if let Some(rhs_syntax_id) = &v.rhs_syntax {
+        let rhs_syntax = syn_by_id[rhs_syntax_id];
         match rhs_syntax {
             // Step over this novel atom.
             Syntax::Atom { .. } => {
@@ -552,7 +562,7 @@ pub fn neighbours<'a>(v: &Vertex<'a>, buf: &mut [Option<(Edge, Vertex<'a>)>]) {
                     },
                     Vertex {
                         lhs_syntax: v.lhs_syntax,
-                        rhs_syntax: rhs_syntax.next_sibling(),
+                        rhs_syntax: rhs_syntax.next_sibling().map(Syntax::id),
                         parents: v.parents.clone(),
                         lhs_parent_id: v.lhs_parent_id,
                         rhs_parent_id: v.rhs_parent_id,
@@ -563,7 +573,7 @@ pub fn neighbours<'a>(v: &Vertex<'a>, buf: &mut [Option<(Edge, Vertex<'a>)>]) {
             }
             // Step into this partially/fully novel list.
             Syntax::List { children, .. } => {
-                let rhs_next = children.get(0).copied();
+                let rhs_next = children.get(0).map(|n| n.id());
 
                 let parents_next = push_rhs_delimiter(&v.parents, rhs_syntax);
 
@@ -590,7 +600,7 @@ pub fn neighbours<'a>(v: &Vertex<'a>, buf: &mut [Option<(Edge, Vertex<'a>)>]) {
     );
 }
 
-pub fn populate_change_map<'a>(route: &[(Edge, Vertex<'a>)], change_map: &mut ChangeMap<'a>) {
+pub fn populate_change_map<'a>(route: &[(Edge, Vertex<'a>)], change_map: &mut ChangeMap<'a>, syn_by_id: &FxHashMap<SyntaxId, &'a Syntax<'a>>,) {
     for (e, v) in route {
         match e {
             ExitDelimiterBoth | ExitDelimiterLHS | ExitDelimiterRHS => {
@@ -598,8 +608,8 @@ pub fn populate_change_map<'a>(route: &[(Edge, Vertex<'a>)], change_map: &mut Ch
             }
             UnchangedNode { .. } => {
                 // No change on this node or its children.
-                let lhs = v.lhs_syntax.unwrap();
-                let rhs = v.rhs_syntax.unwrap();
+                let lhs = syn_by_id[&v.lhs_syntax.unwrap()];
+                let rhs = syn_by_id[&v.rhs_syntax.unwrap()];
 
                 insert_deep_unchanged(lhs, rhs, change_map);
                 insert_deep_unchanged(rhs, lhs, change_map);
@@ -607,14 +617,14 @@ pub fn populate_change_map<'a>(route: &[(Edge, Vertex<'a>)], change_map: &mut Ch
             EnterUnchangedDelimiter { .. } => {
                 // No change on the outer delimiter, but children may
                 // have changed.
-                let lhs = v.lhs_syntax.unwrap();
-                let rhs = v.rhs_syntax.unwrap();
+                let lhs = syn_by_id[&v.lhs_syntax.unwrap()];
+                let rhs = syn_by_id[&v.rhs_syntax.unwrap()];
                 change_map.insert(lhs, ChangeKind::Unchanged(rhs));
                 change_map.insert(rhs, ChangeKind::Unchanged(lhs));
             }
             ReplacedComment { levenshtein_pct } => {
-                let lhs = v.lhs_syntax.unwrap();
-                let rhs = v.rhs_syntax.unwrap();
+                let lhs = syn_by_id[&v.lhs_syntax.unwrap()];
+                let rhs = syn_by_id[&v.rhs_syntax.unwrap()];
 
                 if *levenshtein_pct > 40 {
                     change_map.insert(lhs, ChangeKind::ReplacedComment(lhs, rhs));
@@ -625,11 +635,11 @@ pub fn populate_change_map<'a>(route: &[(Edge, Vertex<'a>)], change_map: &mut Ch
                 }
             }
             NovelAtomLHS { .. } | EnterNovelDelimiterLHS { .. } => {
-                let lhs = v.lhs_syntax.unwrap();
+                let lhs = syn_by_id[&v.lhs_syntax.unwrap()];
                 change_map.insert(lhs, ChangeKind::Novel);
             }
             NovelAtomRHS { .. } | EnterNovelDelimiterRHS { .. } => {
-                let rhs = v.rhs_syntax.unwrap();
+                let rhs = syn_by_id[&v.rhs_syntax.unwrap()];
                 change_map.insert(rhs, ChangeKind::Novel);
             }
         }
